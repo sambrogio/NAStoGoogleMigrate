@@ -1,0 +1,147 @@
+from __future__ import print_function
+import pickle
+import mimetypes
+import time
+import os.path
+from os import path
+import csv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from apiclient.http import MediaFileUpload
+
+#Gives scope for Google session and gets service account credentials
+SCOPES = ['https://www.googleapis.com/auth/drive']
+SERVICE_ACCOUNT_FILE = 'INSERT FILEPATH FOR JSON FILE FOR SERVICE ACCOUNT HERE'
+
+credentials = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+
+servicecredentials = credentials
+
+#File where user emails are stored
+csvDataFile = open('PATH THAT CONTAINS LIST OF USERS IN CSV FILE')
+csvReader = csv.reader(csvDataFile)
+
+#Location of NAS
+homedir = "NETWORK PATH FOR FILE SERVER"
+
+#Keeps track of errors
+errorfile = open('errors.txt', 'a+', encoding='utf-8')
+errorfile.write('\nStart of program run\n')
+#Dumps output to file
+outputfile = open('output.txt', 'a+', encoding='utf-8')
+outputfile.write('\nStart of program run\n')
+
+for row in csvReader:
+    #Get Google username and corresponding directory in NAS, assumes both are the same
+    #This version removes the domain from the Google username to find the folder on the network - you could also have a separate column with the folder name next to the Google username
+    accountname = row[0].replace('@DOMAIN.ORG','')
+    userpath = homedir + '\\' +  accountname
+    #Make sure the path exists
+    if path.exists(userpath):
+        try:
+            #log in with the user's credentials and access their drive
+            starttime = time.perf_counter()
+            delegated_credentials = credentials.with_subject(row[0])
+            service = build('drive', 'v3', credentials=delegated_credentials)
+
+            #Make main directory
+            file_metadata = {
+                'name': 'OLD H DRIVE',
+                'mimeType': 'application/vnd.google-apps.folder'
+            }
+            file = service.files().create(body=file_metadata,
+                                            fields='id').execute()
+            folder_id = file.get('id')
+
+            #List names of folders in NAS along with their corresponding Google IDs
+            #Clunky way to do it but it works - it's just an array with the Windows path name next to the Google folder ID for each folder
+            folnames = []
+            folnames.append(userpath)
+            folids = []
+            folids.append(folder_id)
+            
+            for (dirpath, dirnames, filenames) in os.walk(userpath):
+                #Figure out which subdirectory program is in and find corresponding Google ID
+                i = 0
+                while (folnames[i] != dirpath):
+                    i+=1
+                    if i >= len(folnames):
+                        i = 0;
+                        break;
+                
+                #Add all folders in current directory
+                for dirname in dirnames:
+                    try:
+                        print("Uploading folder " + dirname + " from " + folnames[i])
+                        outputfile.write("Uploading folder " + dirname + " from " + folnames[i] + "\n")
+                        file_metadata = {
+                            'name': dirname,
+                            'parents' : [folids[i]],
+                            'mimeType': 'application/vnd.google-apps.folder'
+                            }
+                        file = service.files().create(body=file_metadata,
+                                                      fields='id').execute()
+                        folder_id = file.get('id')
+                        folnames.append(dirpath + "\\" + str(dirname))
+                        folids.append(folder_id)
+                        print("Upload Complete")
+                        outputfile.write("Upload Complete\n")
+                    except Exception as e:
+                        print("Folder transfer error")
+                        outputfile.write("Folder transfer error\n")
+                        errorfile.write("Error uploading folder " + dirname + " from " + folnames[i] + "\n")
+                #Add all files in current directory
+                for filename in filenames:
+                    filepath = dirpath + "\\" + filename
+                    filesize = os.path.getsize(filepath)
+
+                    #check to see if credentials will time out soon and renew them if so
+                    curtime = starttime - time.perf_counter()
+                    if (curtime > 18000):
+                        starttime = time.perf_counter()
+                        delegated_credentials = credentials.with_subject(row[0])
+                        service = build('drive', 'v3', credentials=delegated_credentials)
+                    #Files of size 0 would cause crash, large files take forever
+                    if filesize > 0 and filesize < 1500000000:                        
+                        try:
+                            print("Uploading file " + filename + " from " + folnames[i])
+                            outputfile.write("Uploading file " + filename + " from " + folnames[i] + "\n")
+                            mime = mimetypes.MimeTypes().guess_type(filepath)[1]
+                            file_metadata = {'name': filename,
+                                         'parents' : [folids[i]],
+                                         'mimeType': mime}
+                            media = MediaFileUpload(filepath, mimetype = mime, resumable=True)
+                            file = service.files().create(body=file_metadata,
+                                                      media_body=media,
+                                                      fields='id').execute()
+                            print("Upload Complete")
+                            outputfile.write("Upload Complete\n")
+                        except Exception as e:
+                            print("File transfer error")
+                            outputfile.write("File transfer error\n")
+                            errorfile.write("Error uploading file " + filename + " from " + folnames[i] + "\n")
+                    else:                        
+                        print("Size out of range. Writing path to text file.")
+                        print(filepath)
+                        if filesize < 1:
+                            errorfile.write("Size is 0 for file " + filepath + "\n")
+                            outputfile.write("Size is 0 for file " + filepath + "\n")
+                        else:
+                            errorfile.write("Size is over maximum for file " + filepath + "\n")
+                            outputfile.write("Size is over maximum for file " + filepath + "\n")
+        #The exception handling is bad and generic - feel free to improve
+        except Exception as e:
+            print("Account does not exist or had error")
+            errorfile.write("Account " + row[0] + " does not exist or had error\n")
+            outputfile.write("Account " + row[0] + " does not exist or had error\n")
+    else:
+        print(userpath + " does not exist")
+        errorfile.write("Local folder for " + userpath + " does not exist\n")
+        outputfile.write("Local folder for " + userpath + " does not exist\n")
+        
+csvDataFile.close()
+errorfile.close()
+outputfile.close()
